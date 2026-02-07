@@ -3,6 +3,7 @@
 Substack Publisher - Publish markdown posts to Substack as drafts or articles.
 
 Converts markdown to Substack's ProseMirror JSON format and publishes via API.
+Supports uploading local images.
 
 Requires environment variables:
     SUBSTACK_SID       - substack.sid session cookie value
@@ -16,12 +17,16 @@ Usage:
 """
 
 import argparse
+import base64
 import json
 import os
 import re
+import struct
 import sys
+import urllib.parse
 import urllib.request
 import urllib.error
+from pathlib import Path
 
 
 # Metadata sections to exclude from the body
@@ -137,8 +142,6 @@ def parse_inline(text):
         return []
 
     nodes = []
-    # Combined pattern for inline elements
-    # Order matters: bold before italic, links need special handling
     pattern = re.compile(
         r'(\*\*(.+?)\*\*)'      # bold
         r'|(\*(.+?)\*)'          # italic
@@ -148,7 +151,6 @@ def parse_inline(text):
 
     pos = 0
     for m in pattern.finditer(text):
-        # Add plain text before this match
         if m.start() > pos:
             plain = text[pos:m.start()]
             if plain:
@@ -173,23 +175,19 @@ def parse_inline(text):
                 "marks": [{"type": "code"}],
             })
         elif m.group(8) is not None:  # link
-            link_text = m.group(8)
-            link_url = m.group(9)
             nodes.append({
                 "type": "text",
-                "text": link_text,
-                "marks": [{"type": "link", "attrs": {"href": link_url}}],
+                "text": m.group(8),
+                "marks": [{"type": "link", "attrs": {"href": m.group(9)}}],
             })
 
         pos = m.end()
 
-    # Add remaining text
     if pos < len(text):
         remaining = text[pos:]
         if remaining:
             nodes.append({"type": "text", "text": remaining})
 
-    # If no matches were found, return the whole text as one node
     if not nodes and text:
         nodes.append({"type": "text", "text": text})
 
@@ -215,24 +213,24 @@ def make_heading(text, level):
     return node
 
 
-def md_to_prosemirror(markdown):
+def md_to_prosemirror(markdown, base_dir="."):
     """
     Convert markdown body text to ProseMirror JSON document.
 
-    Two-pass approach:
-    - Pass 1: Block-level state machine (paragraphs, headings, lists, code blocks,
-      blockquotes, horizontal rules, images)
-    - Pass 2: Inline mark parsing via regex (bold, italic, code, links)
+    Returns: (doc, local_images)
+    - doc: ProseMirror JSON document
+    - local_images: list of {"index": int, "path": str, "alt": str} for local images
     """
     lines = markdown.split("\n")
     content = []
+    local_images = []
 
     i = 0
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
 
-        # Empty line -> skip (paragraphs handle their own grouping)
+        # Empty line
         if not stripped:
             i += 1
             continue
@@ -249,7 +247,7 @@ def md_to_prosemirror(markdown):
                 code_lines.append(lines[i].rstrip("\n"))
                 i += 1
             else:
-                i += 1  # unterminated code block
+                i += 1
 
             code_text = "\n".join(code_lines)
             node = {"type": "codeBlock"}
@@ -266,7 +264,7 @@ def md_to_prosemirror(markdown):
             i += 1
             continue
 
-        # Headings (## and ###)
+        # Headings
         if stripped.startswith("### "):
             content.append(make_heading(stripped[4:].strip(), 3))
             i += 1
@@ -294,7 +292,22 @@ def md_to_prosemirror(markdown):
                     node["content"] = [make_paragraph(alt)]
                 content.append(node)
             else:
-                print(f"Warning: Skipping local image: {src}", file=sys.stderr)
+                # Local image - resolve path and track for upload
+                image_path = os.path.join(base_dir, src)
+                if os.path.isfile(image_path):
+                    placeholder = {
+                        "type": "captionedImage",
+                        "attrs": {"_local_path": image_path, "_alt": alt},
+                    }
+                    local_images.append({
+                        "index": len(content),
+                        "path": image_path,
+                        "alt": alt,
+                    })
+                    content.append(placeholder)
+                    print(f"Found local image: {src}", file=sys.stderr)
+                else:
+                    print(f"Warning: Local image not found: {image_path}", file=sys.stderr)
             i += 1
             continue
 
@@ -352,21 +365,19 @@ def md_to_prosemirror(markdown):
             continue
 
         # Bold label on standalone line -> H3 heading
-        # e.g., "**Paragraph 1 - The Problem:**"
         bold_label = re.match(r'^\*\*(.+?):\*\*\s*$', stripped)
         if bold_label:
             content.append(make_heading(bold_label.group(1), 3))
             i += 1
             continue
 
-        # Regular paragraph (collect consecutive non-empty, non-special lines)
+        # Regular paragraph
         para_lines = []
         while i < len(lines):
             s = lines[i].strip()
             if not s:
                 i += 1
                 break
-            # Stop if next line is a block-level element
             if (s.startswith("#") or s.startswith("```") or s.startswith("> ")
                     or s.startswith("- ") or s.startswith("* ")
                     or re.match(r'^\d+\.\s', s)
@@ -381,8 +392,168 @@ def md_to_prosemirror(markdown):
             text = " ".join(para_lines)
             content.append(make_paragraph(text))
 
-    return {"type": "doc", "content": content if content else [{"type": "paragraph"}]}
+    doc = {"type": "doc", "content": content if content else [{"type": "paragraph"}]}
+    return doc, local_images
 
+
+# --- Image handling ---
+
+def detect_mime_type(image_bytes):
+    """Detect image MIME type from magic bytes."""
+    if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    elif image_bytes[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        return "image/webp"
+    elif image_bytes[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    return "image/png"
+
+
+def get_image_dimensions(image_bytes):
+    """Get (width, height) from image bytes. Returns (0, 0) if unknown."""
+    # PNG: width/height in IHDR chunk at bytes 16-23
+    if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        try:
+            width = struct.unpack('>I', image_bytes[16:20])[0]
+            height = struct.unpack('>I', image_bytes[20:24])[0]
+            return width, height
+        except struct.error:
+            return 0, 0
+
+    # JPEG: scan for SOF marker
+    if image_bytes[:2] == b'\xff\xd8':
+        try:
+            i = 2
+            while i < len(image_bytes) - 1:
+                if image_bytes[i] != 0xFF:
+                    break
+                marker = image_bytes[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2):
+                    height = struct.unpack('>H', image_bytes[i+5:i+7])[0]
+                    width = struct.unpack('>H', image_bytes[i+7:i+9])[0]
+                    return width, height
+                elif marker == 0xD9:
+                    break
+                elif marker in range(0xD0, 0xD9) or marker == 0x01:
+                    i += 2
+                else:
+                    length = struct.unpack('>H', image_bytes[i+2:i+4])[0]
+                    i += 2 + length
+        except (struct.error, IndexError):
+            return 0, 0
+
+    return 0, 0
+
+
+def upload_image(config, image_path, post_id):
+    """
+    Upload a local image to Substack.
+
+    Returns: dict with image metadata, or None on failure.
+    """
+    image_bytes = Path(image_path).read_bytes()
+    mime_type = detect_mime_type(image_bytes)
+    b64_data = base64.b64encode(image_bytes).decode("ascii")
+    data_uri = f"data:{mime_type};base64,{b64_data}"
+
+    url = f"https://{config['subdomain']}.substack.com/api/v1/image"
+    payload = {
+        "image": data_uri,
+        "postId": post_id,
+    }
+
+    headers = _make_headers(config)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        print(f"Image upload error ({e.code}): {error_body}", file=sys.stderr)
+        return None
+    except urllib.error.URLError as e:
+        print(f"Image upload network error: {e.reason}", file=sys.stderr)
+        return None
+
+    width, height = get_image_dimensions(image_bytes)
+
+    return {
+        "src": result.get("url", result.get("src", "")),
+        "width": result.get("width", width),
+        "height": result.get("height", height),
+        "bytes": len(image_bytes),
+        "type": mime_type,
+        "response": result,
+    }
+
+
+def build_image_node(config, image_info, post_id, alt=None):
+    """Build a captionedImage node with image2 child from upload response."""
+    src = image_info["src"]
+    internal_redirect = (
+        f"https://{config['subdomain']}.substack.com/i/{post_id}"
+        f"?img={urllib.parse.quote(src, safe='')}"
+    )
+
+    image2_node = {
+        "type": "image2",
+        "attrs": {
+            "src": src,
+            "srcNoWatermark": None,
+            "fullscreen": None,
+            "imageSize": None,
+            "height": image_info.get("height"),
+            "width": image_info.get("width"),
+            "resizeWidth": None,
+            "bytes": image_info.get("bytes"),
+            "alt": alt,
+            "title": None,
+            "type": image_info.get("type", "image/png"),
+            "href": None,
+            "belowTheFold": False,
+            "topImage": False,
+            "internalRedirect": internal_redirect,
+            "isProcessing": False,
+            "align": None,
+            "offset": False,
+        },
+    }
+
+    return {
+        "type": "captionedImage",
+        "content": [image2_node],
+    }
+
+
+def resolve_local_images(config, doc, local_images, post_id):
+    """Upload local images and replace placeholder nodes in the doc."""
+    if not local_images:
+        return doc
+
+    for img_info in local_images:
+        idx = img_info["index"]
+        path = img_info["path"]
+        alt = img_info["alt"]
+
+        print(f"Uploading image: {os.path.basename(path)}...", file=sys.stderr)
+        upload_result = upload_image(config, path, post_id)
+
+        if upload_result and upload_result["src"]:
+            node = build_image_node(config, upload_result, post_id, alt=alt or None)
+            doc["content"][idx] = node
+            print(f"  -> {upload_result['src']}", file=sys.stderr)
+        else:
+            doc["content"][idx] = {"type": "paragraph"}
+            print(f"  Failed to upload: {path}", file=sys.stderr)
+
+    return doc
+
+
+# --- API helpers ---
 
 def _make_headers(config):
     """Build HTTP headers that pass Cloudflare checks."""
@@ -402,11 +573,7 @@ def _make_headers(config):
 
 
 def create_draft(config, title, subtitle, body_json, audience="everyone"):
-    """
-    Create a draft on Substack.
-
-    Returns: draft data dict (includes 'id' for the draft)
-    """
+    """Create a draft on Substack. Returns: draft data dict."""
     url = f"https://{config['subdomain']}.substack.com/api/v1/drafts"
 
     payload = {
@@ -423,7 +590,6 @@ def create_draft(config, title, subtitle, body_json, audience="everyone"):
     }
 
     headers = _make_headers(config)
-
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
@@ -446,14 +612,47 @@ def create_draft(config, title, subtitle, body_json, audience="everyone"):
     return result
 
 
+def update_draft(config, draft_id, title, subtitle, body_json, audience="everyone"):
+    """Update an existing draft on Substack via PUT."""
+    url = f"https://{config['subdomain']}.substack.com/api/v1/drafts/{draft_id}"
+
+    payload = {
+        "draft_title": title,
+        "draft_subtitle": subtitle,
+        "draft_podcast_url": None,
+        "draft_podcast_duration": None,
+        "draft_body": json.dumps(body_json),
+        "section_chosen": False,
+        "draft_section_id": None,
+        "draft_bylines": [{"id": config["user_id"], "is_guest": False}],
+        "audience": audience,
+        "type": "newsletter",
+    }
+
+    headers = _make_headers(config)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="PUT")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        print(f"Update draft error ({e.code}): {error_body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Network Error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+    return result
+
+
 def publish_draft(config, draft_id):
     """Publish an existing draft on Substack."""
     url = f"https://{config['subdomain']}.substack.com/api/v1/drafts/{draft_id}/publish"
 
     payload = {"send": True}
-
     headers = _make_headers(config)
-
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
@@ -497,6 +696,7 @@ Examples:
     args = parser.parse_args()
 
     # Parse markdown
+    filepath = Path(args.file)
     print(f"Parsing: {args.file}", file=sys.stderr)
     title, subtitle, body = parse_markdown(args.file)
 
@@ -509,8 +709,12 @@ Examples:
     if subtitle:
         print(f"Subtitle: {subtitle[:80]}{'...' if len(subtitle) > 80 else ''}", file=sys.stderr)
 
-    # Convert to ProseMirror
-    body_json = md_to_prosemirror(body)
+    # Convert to ProseMirror (resolve image paths relative to the markdown file)
+    base_dir = str(filepath.parent) if filepath.parent != Path() else "."
+    body_json, local_images = md_to_prosemirror(body, base_dir=base_dir)
+
+    if local_images:
+        print(f"Found {len(local_images)} local image(s) to upload", file=sys.stderr)
 
     # Dry run - just output JSON
     if args.dry_run:
@@ -526,6 +730,13 @@ Examples:
     draft_url = f"https://{config['subdomain']}.substack.com/publish/post/{draft_id}"
 
     print(f"Draft created: {draft_url}", file=sys.stderr)
+
+    # Upload local images and update draft
+    if local_images:
+        body_json = resolve_local_images(config, body_json, local_images, draft_id)
+        print("Updating draft with images...", file=sys.stderr)
+        update_draft(config, draft_id, title, subtitle, body_json, args.audience)
+        print("Draft updated with images.", file=sys.stderr)
 
     # Publish if requested
     if args.publish:
