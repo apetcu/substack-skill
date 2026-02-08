@@ -120,8 +120,20 @@ def parse_markdown(filepath):
         # Everything else goes to body
         body_lines.append(stripped)
 
-    # Clean up subtitle
-    subtitle = "\n".join(subtitle_lines).strip()
+    # Split hook: first paragraph -> subtitle, rest -> prepend to body
+    hook_text = "\n".join(subtitle_lines).strip()
+    if hook_text:
+        # Split on first blank line or --- divider to get first paragraph
+        parts = re.split(r'\n\s*\n', hook_text, maxsplit=1)
+        subtitle = parts[0].strip()
+        if len(parts) > 1:
+            # Remove leading --- divider if present
+            remainder = parts[1].strip()
+            remainder = re.sub(r'^---\s*\n?', '', remainder).strip()
+            if remainder:
+                body_lines = remainder.split("\n") + [""] + body_lines
+    else:
+        subtitle = ""
 
     # Clean up body - remove leading/trailing blank lines
     while body_lines and not body_lines[0].strip():
@@ -679,12 +691,14 @@ Examples:
   %(prog)s post.md --dry-run
   %(prog)s post.md --title "Custom Title"
   %(prog)s post.md --publish --audience everyone
+  %(prog)s post.md --update 187272495
         """,
     )
     parser.add_argument("file", help="Markdown file to publish")
     parser.add_argument("--title", help="Override post title (default: from # heading)")
     parser.add_argument("--subtitle", help="Override subtitle (default: from ## Hook)")
     parser.add_argument("--publish", action="store_true", help="Publish immediately (default: draft only)")
+    parser.add_argument("--update", metavar="POST_ID", type=int, help="Update an existing draft/post by ID instead of creating a new one")
     parser.add_argument(
         "--audience",
         choices=["everyone", "paid"],
@@ -721,8 +735,31 @@ Examples:
         print(json.dumps(body_json, indent=2))
         return
 
-    # Create draft
     config = get_config()
+
+    # Update existing post
+    if args.update:
+        draft_id = args.update
+        draft_url = f"https://{config['subdomain']}.substack.com/publish/post/{draft_id}"
+        print(f"Updating post {draft_id} on {config['subdomain']}.substack.com...", file=sys.stderr)
+
+        # Upload local images first
+        if local_images:
+            body_json = resolve_local_images(config, body_json, local_images, draft_id)
+
+        update_draft(config, draft_id, title, subtitle, body_json, args.audience)
+        print(f"Draft body updated.", file=sys.stderr)
+
+        # Re-publish to push changes live
+        print("Re-publishing to apply changes...", file=sys.stderr)
+        result = publish_draft(config, draft_id)
+        slug = result.get("slug", "")
+        post_url = f"https://{config['subdomain']}.substack.com/p/{slug}"
+        print(f"Published: {post_url}", file=sys.stderr)
+        print(post_url)
+        return
+
+    # Create new draft
     print(f"Creating draft on {config['subdomain']}.substack.com...", file=sys.stderr)
 
     draft = create_draft(config, title, subtitle, body_json, args.audience)
